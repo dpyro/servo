@@ -512,17 +512,17 @@ impl ToGfxMatrix for ComputedMatrix {
 /// dimension. The `min` is >= 0, as negative values are illegal and by
 /// default `min` is 0.
 #[derive(Debug)]
-pub struct MinMaxConstraint {
-    min: Au,
-    max: Option<Au>
+pub struct SizeConstraint {
+    min_size: Au,
+    max_size: Option<Au>,
 }
 
-impl MinMaxConstraint {
-    /// Create a `MinMaxConstraint` for a dimension given the min, max, and content box size for
+impl SizeConstraint {
+    /// Create a `SizeConstraint` for a dimension given the min, max, and content box size for
     /// an axis
-    pub fn new(content_size: Option<Au>, min: LengthOrPercentage,
-               max: LengthOrPercentageOrNone) -> MinMaxConstraint {
-        let min = match min {
+    pub fn new(content_size: Option<Au>, min_size: LengthOrPercentage,
+               max_size: LengthOrPercentageOrNone, border: Option<Au>) -> SizeConstraint {
+        let min_size = match min_size {
             LengthOrPercentage::Length(length) => length,
             LengthOrPercentage::Percentage(percent) => {
                 match content_size {
@@ -538,7 +538,7 @@ impl MinMaxConstraint {
             }
         };
 
-        let max = match max {
+        let max_size = match max_size {
             LengthOrPercentageOrNone::Length(length) => Some(length),
             LengthOrPercentageOrNone::Percentage(percent) => {
                 content_size.map(|size| size.scale_by(percent))
@@ -548,20 +548,28 @@ impl MinMaxConstraint {
             }
             LengthOrPercentageOrNone::None => None,
         };
+        let max_size = max_size.map(|x| max(x, min_size));
 
-        MinMaxConstraint {
-            min: min,
-            max: max
+        if let Some(border) = border {
+            SizeConstraint {
+                min_size: max((min_size - border), Au(0)),
+                max_size: max_size.map(|x| max(x - border, Au(0)))
+            }
+        } else {
+            SizeConstraint {
+                min_size: min_size,
+                max_size: max_size
+            }
         }
     }
 
     /// Clamp the given size by the given `min` and `max` constraints.
     pub fn clamp(&self, other: Au) -> Au {
-        if other < self.min {
-            self.min
+        if other < self.min_size {
+            self.min_size
         } else {
-            match self.max {
-                Some(max) if max < other => max,
+            match self.max_size {
+                Some(max_size) if max_size < other => max_size,
                 _ => other
             }
         }
