@@ -23,7 +23,7 @@ use inline::{InlineMetrics, LAST_FRAGMENT_OF_ELEMENT, LineMetrics};
 use ipc_channel::ipc::IpcSender;
 #[cfg(debug_assertions)]
 use layout_debug;
-use model::{self, IntrinsicISizes, IntrinsicISizesContribution, MaybeAuto};
+use model::{self, IntrinsicISizes, IntrinsicISizesContribution, MaybeAuto, SizeConstraint};
 use msg::constellation_msg::PipelineId;
 use net_traits::image::base::{Image, ImageMetadata};
 use net_traits::image_cache_thread::{ImageOrMetadataAvailable, UsePlaceholder};
@@ -34,7 +34,7 @@ use script_layout_interface::wrapper_traits::{PseudoElementType, ThreadSafeLayou
 use serde::{Serialize, Serializer};
 use servo_url::ServoUrl;
 use std::borrow::ToOwned;
-use std::cmp::{max, min};
+use std::cmp::{Ordering, max, min};
 use std::collections::LinkedList;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -327,79 +327,37 @@ impl InlineAbsoluteFragmentInfo {
 
 #[derive(Clone)]
 pub struct CanvasFragmentInfo {
-    pub replaced_image_fragment_info: ReplacedImageFragmentInfo,
     pub ipc_renderer: Option<Arc<Mutex<IpcSender<CanvasMsg>>>>,
     pub dom_width: Au,
     pub dom_height: Au,
 }
 
 impl CanvasFragmentInfo {
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N,
-                                        data: HTMLCanvasData,
-                                        ctx: &SharedStyleContext)
-                                        -> CanvasFragmentInfo {
+    pub fn new(data: HTMLCanvasData,
+               ctx: &SharedStyleContext)
+               -> CanvasFragmentInfo {
         CanvasFragmentInfo {
-            replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, ctx),
             ipc_renderer: data.ipc_renderer
                               .map(|renderer| Arc::new(Mutex::new(renderer))),
             dom_width: Au::from_px(data.width as i32),
             dom_height: Au::from_px(data.height as i32),
         }
     }
-
-    /// Returns the original inline-size of the canvas.
-    pub fn canvas_inline_size(&self) -> Au {
-        if self.replaced_image_fragment_info.writing_mode_is_vertical {
-            self.dom_height
-        } else {
-            self.dom_width
-        }
-    }
-
-    /// Returns the original block-size of the canvas.
-    pub fn canvas_block_size(&self) -> Au {
-        if self.replaced_image_fragment_info.writing_mode_is_vertical {
-            self.dom_width
-        } else {
-            self.dom_height
-        }
-    }
 }
 
 #[derive(Clone)]
 pub struct SvgFragmentInfo {
-    pub replaced_image_fragment_info: ReplacedImageFragmentInfo,
     pub dom_width: Au,
     pub dom_height: Au,
 }
 
 impl SvgFragmentInfo {
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N,
-                                        data: SVGSVGData,
-                                        ctx: &SharedStyleContext)
-                                        -> SvgFragmentInfo {
+    pub fn new(data: SVGSVGData,
+               ctx: &SharedStyleContext)
+               -> SvgFragmentInfo {
         SvgFragmentInfo {
-            replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, ctx),
             dom_width: Au::from_px(data.width as i32),
             dom_height: Au::from_px(data.height as i32),
-        }
-    }
-
-    /// Returns the original inline-size of the SVG element.
-    pub fn svg_inline_size(&self) -> Au {
-        if self.replaced_image_fragment_info.writing_mode_is_vertical {
-            self.dom_height
-        } else {
-            self.dom_width
-        }
-    }
-
-    /// Returns the original block-size of the SVG element.
-    pub fn svg_block_size(&self) -> Au {
-        if self.replaced_image_fragment_info.writing_mode_is_vertical {
-            self.dom_width
-        } else {
-            self.dom_height
         }
     }
 }
@@ -408,8 +366,6 @@ impl SvgFragmentInfo {
 /// A fragment that represents a replaced content image and its accompanying borders, shadows, etc.
 #[derive(Clone)]
 pub struct ImageFragmentInfo {
-    /// The image held within this fragment.
-    pub replaced_image_fragment_info: ReplacedImageFragmentInfo,
     pub image: Option<Arc<Image>>,
     pub metadata: Option<ImageMetadata>,
 }
@@ -419,9 +375,9 @@ impl ImageFragmentInfo {
     ///
     /// FIXME(pcwalton): The fact that image fragments store the cache in the fragment makes little
     /// sense to me.
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N, url: Option<ServoUrl>,
-                                        shared_layout_context: &SharedLayoutContext)
-                                        -> ImageFragmentInfo {
+    pub fn new(url: Option<ServoUrl>,
+               shared_layout_context: &SharedLayoutContext)
+               -> ImageFragmentInfo {
         let image_or_metadata = url.and_then(|url| {
             shared_layout_context.get_or_request_image_or_meta(url, UsePlaceholder::Yes)
         });
@@ -439,37 +395,8 @@ impl ImageFragmentInfo {
         };
 
         ImageFragmentInfo {
-            replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, &shared_layout_context.style_context),
             image: image,
             metadata: metadata,
-        }
-    }
-
-    /// Returns the original inline-size of the image.
-    pub fn image_inline_size(&mut self) -> Au {
-        match self.metadata {
-            Some(ref metadata) => {
-                Au::from_px(if self.replaced_image_fragment_info.writing_mode_is_vertical {
-                    metadata.height
-                } else {
-                    metadata.width
-                } as i32)
-            }
-            None => Au(0)
-        }
-    }
-
-    /// Returns the original block-size of the image.
-    pub fn image_block_size(&mut self) -> Au {
-        match self.metadata {
-            Some(ref metadata) => {
-                Au::from_px(if self.replaced_image_fragment_info.writing_mode_is_vertical {
-                    metadata.width
-                } else {
-                    metadata.height
-                } as i32)
-            }
-            None => Au(0)
         }
     }
 
@@ -545,149 +472,6 @@ impl ImageFragmentInfo {
     }
 }
 
-#[derive(Clone)]
-pub struct ReplacedImageFragmentInfo {
-    pub computed_inline_size: Option<Au>,
-    pub computed_block_size: Option<Au>,
-    pub writing_mode_is_vertical: bool,
-}
-
-impl ReplacedImageFragmentInfo {
-    pub fn new<N>(node: &N, ctx: &SharedStyleContext) -> ReplacedImageFragmentInfo
-            where N: ThreadSafeLayoutNode {
-        let is_vertical = node.style(ctx).writing_mode.is_vertical();
-        ReplacedImageFragmentInfo {
-            computed_inline_size: None,
-            computed_block_size: None,
-            writing_mode_is_vertical: is_vertical,
-        }
-    }
-
-    /// Returns the calculated inline-size of the image, accounting for the inline-size attribute.
-    pub fn computed_inline_size(&self) -> Au {
-        self.computed_inline_size.expect("image inline_size is not computed yet!")
-    }
-
-    /// Returns the calculated block-size of the image, accounting for the block-size attribute.
-    pub fn computed_block_size(&self) -> Au {
-        self.computed_block_size.expect("image block_size is not computed yet!")
-    }
-
-    // Return used value for inline-size or block-size.
-    //
-    // `dom_length`: inline-size or block-size as specified in the `img` tag.
-    // `style_length`: inline-size as given in the CSS
-    pub fn style_length(style_length: LengthOrPercentageOrAuto,
-                        container_size: Option<Au>) -> MaybeAuto {
-        match (style_length, container_size) {
-            (LengthOrPercentageOrAuto::Length(length), _) => MaybeAuto::Specified(length),
-            (LengthOrPercentageOrAuto::Percentage(pc), Some(container_size)) => {
-                MaybeAuto::Specified(container_size.scale_by(pc))
-            }
-            (LengthOrPercentageOrAuto::Percentage(_), None) => MaybeAuto::Auto,
-            (LengthOrPercentageOrAuto::Calc(calc), Some(container_size)) => {
-                MaybeAuto::Specified(calc.length() + container_size.scale_by(calc.percentage()))
-            }
-            (LengthOrPercentageOrAuto::Calc(_), None) => MaybeAuto::Auto,
-            (LengthOrPercentageOrAuto::Auto, _) => MaybeAuto::Auto,
-        }
-    }
-
-    pub fn calculate_replaced_inline_size(&mut self,
-                                          style: &ServoComputedValues,
-                                          noncontent_inline_size: Au,
-                                          container_inline_size: Au,
-                                          container_block_size: Option<Au>,
-                                          fragment_inline_size: Au,
-                                          fragment_block_size: Au)
-                                          -> Au {
-        let style_inline_size = style.content_inline_size();
-        let style_block_size = style.content_block_size();
-        let style_min_inline_size = style.min_inline_size();
-        let style_max_inline_size = style.max_inline_size();
-        let style_min_block_size = style.min_block_size();
-        let style_max_block_size = style.max_block_size();
-
-        // TODO(ksh8281): compute border,margin
-        let inline_size = ReplacedImageFragmentInfo::style_length(
-            style_inline_size,
-            Some(container_inline_size));
-
-        let inline_size = match inline_size {
-            MaybeAuto::Auto => {
-                let intrinsic_width = fragment_inline_size;
-                let intrinsic_height = fragment_block_size;
-                if intrinsic_height == Au(0) {
-                    intrinsic_width
-                } else {
-                    let ratio = intrinsic_width.to_f32_px() /
-                                intrinsic_height.to_f32_px();
-
-                    let specified_height = ReplacedImageFragmentInfo::style_length(
-                        style_block_size,
-                        container_block_size);
-                    let specified_height = match specified_height {
-                        MaybeAuto::Auto => intrinsic_height,
-                        MaybeAuto::Specified(h) => h,
-                    };
-                    let specified_height = clamp_size(specified_height,
-                                                      style_min_block_size,
-                                                      style_max_block_size,
-                                                      Au(0));
-                    Au::from_f32_px(specified_height.to_f32_px() * ratio)
-                }
-            },
-            MaybeAuto::Specified(w) => w,
-        };
-
-        let inline_size = clamp_size(inline_size,
-                                     style_min_inline_size,
-                                     style_max_inline_size,
-                                     container_inline_size);
-
-        self.computed_inline_size = Some(inline_size);
-        inline_size + noncontent_inline_size
-    }
-
-    /// Here, `noncontent_block_size` represents the sum of border and padding, but not margin.
-    pub fn calculate_replaced_block_size(&mut self,
-                                         style: &ServoComputedValues,
-                                         noncontent_block_size: Au,
-                                         containing_block_block_size: Option<Au>,
-                                         fragment_inline_size: Au,
-                                         fragment_block_size: Au)
-                                         -> Au {
-        let style_block_size = style.content_block_size();
-        let style_min_block_size = style.min_block_size();
-        let style_max_block_size = style.max_block_size();
-
-        let inline_size = self.computed_inline_size();
-        let block_size = ReplacedImageFragmentInfo::style_length(
-            style_block_size,
-            containing_block_block_size);
-
-        let block_size = match block_size {
-            MaybeAuto::Auto => {
-                let intrinsic_width = fragment_inline_size;
-                let intrinsic_height = fragment_block_size;
-                let scale = intrinsic_width.to_f32_px() / inline_size.to_f32_px();
-                Au::from_f32_px(intrinsic_height.to_f32_px() / scale)
-            },
-            MaybeAuto::Specified(h) => {
-                h
-            }
-        };
-
-        let block_size = clamp_size(block_size,
-                                    style_min_block_size,
-                                    style_max_block_size,
-                                    Au(0));
-
-        self.computed_block_size = Some(block_size);
-        block_size + noncontent_block_size
-    }
-}
-
 /// A fragment that represents an inline frame (iframe). This stores the pipeline ID so that the
 /// size of this iframe can be communicated via the constellation to the iframe's own layout thread.
 #[derive(Clone)]
@@ -703,52 +487,6 @@ impl IframeFragmentInfo {
         IframeFragmentInfo {
             pipeline_id: pipeline_id,
         }
-    }
-
-    #[inline]
-    pub fn calculate_replaced_inline_size(&self, style: &ServoComputedValues, containing_size: Au)
-                                          -> Au {
-        // Calculate the replaced inline size (or default) as per CSS 2.1 § 10.3.2
-        IframeFragmentInfo::calculate_replaced_size(style.content_inline_size(),
-                                                    style.min_inline_size(),
-                                                    style.max_inline_size(),
-                                                    Some(containing_size),
-                                                    Au::from_px(300))
-    }
-
-    #[inline]
-    pub fn calculate_replaced_block_size(&self, style: &ServoComputedValues, containing_size: Option<Au>)
-                                         -> Au {
-        // Calculate the replaced block size (or default) as per CSS 2.1 § 10.3.2
-        IframeFragmentInfo::calculate_replaced_size(style.content_block_size(),
-                                                    style.min_block_size(),
-                                                    style.max_block_size(),
-                                                    containing_size,
-                                                    Au::from_px(150))
-
-    }
-
-    fn calculate_replaced_size(content_size: LengthOrPercentageOrAuto,
-                               style_min_size: LengthOrPercentage,
-                               style_max_size: LengthOrPercentageOrNone,
-                               containing_size: Option<Au>,
-                               default_size: Au) -> Au {
-        let computed_size = match (content_size, containing_size) {
-            (LengthOrPercentageOrAuto::Length(length), _) => length,
-            (LengthOrPercentageOrAuto::Percentage(pc), Some(container_size)) => container_size.scale_by(pc),
-            (LengthOrPercentageOrAuto::Calc(calc), Some(container_size)) => {
-                container_size.scale_by(calc.percentage()) + calc.length()
-            },
-            (LengthOrPercentageOrAuto::Calc(calc), None) => calc.length(),
-            (LengthOrPercentageOrAuto::Percentage(_), None) => default_size,
-            (LengthOrPercentageOrAuto::Auto, _) => default_size,
-        };
-
-        let containing_size = containing_size.unwrap_or(Au(0));
-        clamp_size(computed_size,
-                   style_min_size,
-                   style_max_size,
-                   containing_size)
     }
 }
 
@@ -1203,6 +941,142 @@ impl Fragment {
         }
     }
 
+    pub fn intrinsic_width(&self) -> Au {
+        match self.specific {
+            SpecificFragmentInfo::Image(ref info) => {
+                if let Some(ref data) = info.metadata {
+                    Au::from_px(data.width as i32)
+                } else {
+                    Au(0)
+                }
+            }
+            SpecificFragmentInfo::Canvas(ref info) => info.dom_width,
+            SpecificFragmentInfo::Svg(ref info) => info.dom_width,
+            SpecificFragmentInfo::Iframe(_) => Au::from_px(300),
+            _ => panic!("Trying to get intrinsic width on non-replaced element!")
+        }
+    }
+
+    pub fn intrinsic_height(&self) -> Au {
+        match self.specific {
+            SpecificFragmentInfo::Image(ref info) => {
+                if let Some(ref data) = info.metadata {
+                    Au::from_px(data.height as i32)
+                } else {
+                    Au(0)
+                }
+            }
+            SpecificFragmentInfo::Canvas(ref info) => info.dom_height,
+            SpecificFragmentInfo::Svg(ref info) => info.dom_height,
+            SpecificFragmentInfo::Iframe(_) => Au::from_px(150),
+            _ => panic!("Tried to get intrinsic width on non-replaced element!")
+        }
+    }
+
+    pub fn has_intrinsic_ratio(&self) -> bool {
+        match self.specific {
+            SpecificFragmentInfo::Image(_)  |
+            SpecificFragmentInfo::Canvas(_) |
+            SpecificFragmentInfo::Svg(_) =>
+                self.intrinsic_width() != Au(0) && self.intrinsic_height() != Au(0),
+            _ => false
+        }
+    }
+
+    pub fn calculate_replaced_sizes(&self,
+                                    containing_inline_size: Option<Au>,
+                                    containing_block_size: Option<Au>)
+                                    -> (Au, Au) {
+        let (intrinsic_inline_size, intrinsic_block_size) = if self.style.writing_mode.is_vertical() {
+            (self.intrinsic_height(), self.intrinsic_width())
+        } else {
+            (self.intrinsic_width(), self.intrinsic_height())
+        };
+
+        let inline_size = style_length(self.style.content_inline_size(), containing_inline_size)
+                                     .map(|x| x - self.box_sizing_boundary(Direction::Inline));
+        let block_size = style_length(self.style.content_block_size(), containing_block_size)
+                                     .map(|x| x - self.box_sizing_boundary(Direction::Block));
+        let inline_constraint = self.size_constraint(containing_inline_size, Direction::Inline);
+        let block_constraint = self.size_constraint(containing_block_size, Direction::Block);
+
+        match (inline_size, block_size) {
+            (MaybeAuto::Specified(inline_size), MaybeAuto::Specified(block_size)) =>
+                (inline_constraint.clamp(inline_size), block_constraint.clamp(block_size)),
+
+            (MaybeAuto::Specified(inline_size), MaybeAuto::Auto) => {
+                let inline_size = inline_constraint.clamp(inline_size);
+                let block_size = if self.has_intrinsic_ratio() {
+                    inline_size * intrinsic_block_size.0 / intrinsic_inline_size.0
+                } else {
+                    intrinsic_block_size
+                };
+                (inline_size, block_constraint.clamp(block_size))
+            }
+            (MaybeAuto::Auto, MaybeAuto::Specified(block_size)) => {
+                let block_size = block_constraint.clamp(block_size);
+                let inline_size = if self.has_intrinsic_ratio() {
+                    block_size * intrinsic_inline_size.0 / intrinsic_block_size.0
+                } else {
+                    intrinsic_inline_size
+                };
+                (inline_constraint.clamp(inline_size), block_size)
+            }
+            (MaybeAuto::Auto, MaybeAuto::Auto) => {
+                if self.has_intrinsic_ratio() {
+                    let (first_isize, first_bsize) = {
+                        let isize = inline_constraint.clamp(intrinsic_inline_size);
+                        let bsize = isize * intrinsic_block_size.0 / intrinsic_inline_size.0;
+                        (isize, bsize)
+                    };
+                    let (second_isize, second_bsize) = {
+                        let bsize = block_constraint.clamp(intrinsic_block_size);
+                        let isize = bsize * intrinsic_inline_size.0 / intrinsic_block_size.0;
+                        (isize, bsize)
+                    };
+                    let (inline_size, block_size) = match (first_isize.cmp(&intrinsic_inline_size) ,
+                                                           second_isize.cmp(&intrinsic_inline_size)) {
+                        (Ordering::Equal, Ordering::Equal) =>
+                            (first_isize, first_bsize),
+                        (Ordering::Equal, _) =>
+                            (second_isize, second_bsize),
+                        (_, Ordering::Equal) =>
+                            (first_isize, first_bsize),
+                        (Ordering::Greater, Ordering::Greater) if first_isize > second_isize =>
+                            (first_isize, first_bsize),
+                        (Ordering::Greater, Ordering::Greater) =>
+                            (second_isize, second_bsize),
+                        (Ordering::Less, Ordering::Less) if first_isize > second_isize =>
+                            (second_isize, second_bsize),
+                        (Ordering::Less, Ordering::Less) =>
+                            (first_isize, first_bsize),
+                        (Ordering::Less, Ordering::Greater) | (Ordering::Greater, Ordering::Less) =>
+                            (first_isize, first_bsize)
+                    };
+                    (inline_constraint.clamp(inline_size), block_constraint.clamp(block_size))
+                } else {
+                    (inline_constraint.clamp(intrinsic_inline_size),
+                    block_constraint.clamp(intrinsic_block_size))
+                }
+            }
+        }
+    }
+
+    pub fn size_constraint(&self, containing_size: Option<Au>, direction: Direction) -> SizeConstraint {
+        let (style_min_size, style_max_size) = match direction {
+            Direction::Inline => (self.style.min_inline_size(), self.style.max_inline_size()),
+            Direction::Block => (self.style.min_block_size(), self.style.max_block_size())
+        };
+
+        let border = if self.style().get_position().box_sizing == box_sizing::T::border_box {
+            Some(self.border_padding.start_end(direction))
+        } else {
+            None
+        };
+
+        SizeConstraint::new(containing_size, style_min_size, style_max_size, border)
+    }
+
     /// Returns a guess as to the distances from the margin edge of this fragment to its content
     /// in the inline direction. This will generally be correct unless percentages are involved.
     ///
@@ -1255,7 +1129,7 @@ impl Fragment {
     }
 
     /// Returns the border width in given direction if this fragment has property
-    /// 'box-sizing: border-box'. The `border_padding` field should have been initialized.
+    /// 'box-sizing: border-box'. The `border_padding` field must have been initialized.
     pub fn box_sizing_boundary(&self, direction: Direction) -> Au {
         match (self.style().get_position().box_sizing, direction) {
             (box_sizing::T::border_box, Direction::Inline) => {
@@ -1532,7 +1406,6 @@ impl Fragment {
         match self.specific {
             SpecificFragmentInfo::Generic |
             SpecificFragmentInfo::GeneratedContent(_) |
-            SpecificFragmentInfo::Iframe(_) |
             SpecificFragmentInfo::Table |
             SpecificFragmentInfo::TableCell |
             SpecificFragmentInfo::TableColumn(_) |
@@ -1549,66 +1422,37 @@ impl Fragment {
                 let block_flow = info.flow_ref.as_block();
                 result.union_block(&block_flow.base.intrinsic_inline_sizes)
             }
-            SpecificFragmentInfo::Image(ref mut image_fragment_info) => {
-                let mut image_inline_size = match self.style.content_inline_size() {
+            SpecificFragmentInfo::Image(_) | SpecificFragmentInfo::Canvas(_) |
+            SpecificFragmentInfo::Iframe(_) | SpecificFragmentInfo::Svg(_) => {
+                let mut inline_size = match self.style.content_inline_size() {
                     LengthOrPercentageOrAuto::Auto |
                     LengthOrPercentageOrAuto::Percentage(_) => {
-                        image_fragment_info.image_inline_size()
+                        let padding = self.style.logical_padding();
+                        self.border_padding.inline_start = model::specified(padding.inline_start, Au(0));
+                        self.border_padding.inline_end = model::specified(padding.inline_end, Au(0));
+                        self.border_padding.block_start = model::specified(padding.block_start, Au(0));
+                        self.border_padding.block_end = model::specified(padding.block_end, Au(0));
+                        let border = self.border_width();
+                        self.border_padding.inline_start += border.inline_start;
+                        self.border_padding.inline_end += border.inline_end;
+                        self.border_padding.block_start += border.block_start;
+                        self.border_padding.block_end += border.block_end;
+                        let (isize, _) = self.calculate_replaced_sizes(None, None);
+                        isize
                     }
                     LengthOrPercentageOrAuto::Length(length) => length,
                     LengthOrPercentageOrAuto::Calc(calc) => calc.length(),
                 };
 
-                image_inline_size = max(model::specified(self.style.min_inline_size(), Au(0)), image_inline_size);
-                if let Some(max) = model::specified_or_none(self.style.max_inline_size(), Au(0)) {
-                    image_inline_size = min(image_inline_size, max)
-                }
+                let size_constraint = self.size_constraint(None, Direction::Inline);
+                inline_size = size_constraint.clamp(inline_size);
 
                 result.union_block(&IntrinsicISizes {
-                    minimum_inline_size: image_inline_size,
-                    preferred_inline_size: image_inline_size,
+                    minimum_inline_size: inline_size,
+                    preferred_inline_size: inline_size,
                 });
             }
-            SpecificFragmentInfo::Canvas(ref mut canvas_fragment_info) => {
-                let mut canvas_inline_size = match self.style.content_inline_size() {
-                    LengthOrPercentageOrAuto::Auto |
-                    LengthOrPercentageOrAuto::Percentage(_) => {
-                        canvas_fragment_info.canvas_inline_size()
-                    }
-                    LengthOrPercentageOrAuto::Length(length) => length,
-                    LengthOrPercentageOrAuto::Calc(calc) => calc.length(),
-                };
 
-                canvas_inline_size = max(model::specified(self.style.min_inline_size(), Au(0)), canvas_inline_size);
-                if let Some(max) = model::specified_or_none(self.style.max_inline_size(), Au(0)) {
-                    canvas_inline_size = min(canvas_inline_size, max)
-                }
-
-                result.union_block(&IntrinsicISizes {
-                    minimum_inline_size: canvas_inline_size,
-                    preferred_inline_size: canvas_inline_size,
-                });
-            }
-            SpecificFragmentInfo::Svg(ref mut svg_fragment_info) => {
-                let mut svg_inline_size = match self.style.content_inline_size() {
-                    LengthOrPercentageOrAuto::Auto |
-                    LengthOrPercentageOrAuto::Percentage(_) => {
-                        svg_fragment_info.svg_inline_size()
-                    }
-                    LengthOrPercentageOrAuto::Length(length) => length,
-                    LengthOrPercentageOrAuto::Calc(calc) => calc.length(),
-                };
-
-                svg_inline_size = max(model::specified(self.style.min_inline_size(), Au(0)), svg_inline_size);
-                if let Some(max) = model::specified_or_none(self.style.max_inline_size(), Au(0)) {
-                    svg_inline_size = min(svg_inline_size, max)
-                }
-
-                result.union_block(&IntrinsicISizes {
-                    minimum_inline_size: svg_inline_size,
-                    preferred_inline_size: svg_inline_size,
-                });
-            }
             SpecificFragmentInfo::ScannedText(ref text_fragment_info) => {
                 let range = &text_fragment_info.range;
 
@@ -1674,45 +1518,6 @@ impl Fragment {
                 text.run.minimum_splittable_inline_size(&text.range)
             }
             _ => Au(0),
-        }
-    }
-
-    /// TODO: What exactly does this function return? Why is it Au(0) for
-    /// `SpecificFragmentInfo::Generic`?
-    pub fn content_inline_size(&self) -> Au {
-        match self.specific {
-            SpecificFragmentInfo::Generic |
-            SpecificFragmentInfo::GeneratedContent(_) |
-            SpecificFragmentInfo::Iframe(_) |
-            SpecificFragmentInfo::Table |
-            SpecificFragmentInfo::TableCell |
-            SpecificFragmentInfo::TableRow |
-            SpecificFragmentInfo::TableWrapper |
-            SpecificFragmentInfo::Multicol |
-            SpecificFragmentInfo::MulticolColumn |
-            SpecificFragmentInfo::InlineBlock(_) |
-            SpecificFragmentInfo::InlineAbsoluteHypothetical(_) |
-            SpecificFragmentInfo::InlineAbsolute(_) => Au(0),
-            SpecificFragmentInfo::Canvas(ref canvas_fragment_info) => {
-                canvas_fragment_info.replaced_image_fragment_info.computed_inline_size()
-            }
-            SpecificFragmentInfo::Svg(ref svg_fragment_info) => {
-                svg_fragment_info.replaced_image_fragment_info.computed_inline_size()
-            }
-            SpecificFragmentInfo::Image(ref image_fragment_info) => {
-                image_fragment_info.replaced_image_fragment_info.computed_inline_size()
-            }
-            SpecificFragmentInfo::ScannedText(ref text_fragment_info) => {
-                let (range, run) = (&text_fragment_info.range, &text_fragment_info.run);
-                let text_bounds = run.metrics_for_range(range).bounding_box;
-                text_bounds.size.width
-            }
-            SpecificFragmentInfo::TableColumn(_) => {
-                panic!("Table column fragments do not have inline_size")
-            }
-            SpecificFragmentInfo::UnscannedText(_) => {
-                panic!("Unscanned text fragments should have been scanned by now!")
-            }
         }
     }
 
@@ -2025,47 +1830,12 @@ impl Fragment {
                 // by this point.
                 self.border_box.size.inline = info.content_size.inline + noncontent_inline_size
             }
-            SpecificFragmentInfo::Image(ref mut image_fragment_info) => {
-                let fragment_inline_size = image_fragment_info.image_inline_size();
-                let fragment_block_size = image_fragment_info.image_block_size();
-                self.border_box.size.inline =
-                    image_fragment_info.replaced_image_fragment_info
-                                       .calculate_replaced_inline_size(style,
-                                                                       noncontent_inline_size,
-                                                                       container_inline_size,
-                                                                       container_block_size,
-                                                                       fragment_inline_size,
-                                                                       fragment_block_size);
-            }
-            SpecificFragmentInfo::Canvas(ref mut canvas_fragment_info) => {
-                let fragment_inline_size = canvas_fragment_info.canvas_inline_size();
-                let fragment_block_size = canvas_fragment_info.canvas_block_size();
-                self.border_box.size.inline =
-                    canvas_fragment_info.replaced_image_fragment_info
-                                        .calculate_replaced_inline_size(style,
-                                                                        noncontent_inline_size,
-                                                                        container_inline_size,
-                                                                        container_block_size,
-                                                                        fragment_inline_size,
-                                                                        fragment_block_size);
-            }
-            SpecificFragmentInfo::Svg(ref mut svg_fragment_info) => {
-                let fragment_inline_size = svg_fragment_info.svg_inline_size();
-                let fragment_block_size = svg_fragment_info.svg_block_size();
-                self.border_box.size.inline =
-                    svg_fragment_info.replaced_image_fragment_info
-                                        .calculate_replaced_inline_size(style,
-                                                                        noncontent_inline_size,
-                                                                        container_inline_size,
-                                                                        container_block_size,
-                                                                        fragment_inline_size,
-                                                                        fragment_block_size);
-            }
-            SpecificFragmentInfo::Iframe(ref iframe_fragment_info) => {
-                self.border_box.size.inline =
-                    iframe_fragment_info.calculate_replaced_inline_size(style,
-                                                                        container_inline_size) +
-                                              noncontent_inline_size;
+            SpecificFragmentInfo::Image(_) | SpecificFragmentInfo::Canvas(_) |
+            SpecificFragmentInfo::Svg(_) | SpecificFragmentInfo::Iframe(_) => {
+                let (inline_size, block_size) =
+                    self.calculate_replaced_sizes(Some(container_inline_size), container_block_size);
+                self.border_box.size.inline = inline_size + self.border_padding.inline_start_end();
+                self.border_box.size.block = block_size + self.border_padding.block_start_end();
             }
             _ => panic!("this case should have been handled above"),
         }
@@ -2105,39 +1875,9 @@ impl Fragment {
         let noncontent_block_size = self.border_padding.block_start_end();
 
         match self.specific {
-            SpecificFragmentInfo::Image(ref mut image_fragment_info) => {
-                let fragment_inline_size = image_fragment_info.image_inline_size();
-                let fragment_block_size = image_fragment_info.image_block_size();
-                self.border_box.size.block =
-                    image_fragment_info.replaced_image_fragment_info
-                                       .calculate_replaced_block_size(style,
-                                                                      noncontent_block_size,
-                                                                      containing_block_block_size,
-                                                                      fragment_inline_size,
-                                                                      fragment_block_size);
-            }
-            SpecificFragmentInfo::Canvas(ref mut canvas_fragment_info) => {
-                let fragment_inline_size = canvas_fragment_info.canvas_inline_size();
-                let fragment_block_size = canvas_fragment_info.canvas_block_size();
-                self.border_box.size.block =
-                    canvas_fragment_info.replaced_image_fragment_info
-                                        .calculate_replaced_block_size(style,
-                                                                       noncontent_block_size,
-                                                                       containing_block_block_size,
-                                                                       fragment_inline_size,
-                                                                       fragment_block_size);
-            }
-            SpecificFragmentInfo::Svg(ref mut svg_fragment_info) => {
-                let fragment_inline_size = svg_fragment_info.svg_inline_size();
-                let fragment_block_size = svg_fragment_info.svg_block_size();
-                self.border_box.size.block =
-                    svg_fragment_info.replaced_image_fragment_info
-                                        .calculate_replaced_block_size(style,
-                                                                       noncontent_block_size,
-                                                                       containing_block_block_size,
-                                                                       fragment_inline_size,
-                                                                       fragment_block_size);
-            }
+            SpecificFragmentInfo::Image(_) | SpecificFragmentInfo::Canvas(_) |
+            SpecificFragmentInfo::Svg(_) | SpecificFragmentInfo::Iframe(_) => {}
+
             SpecificFragmentInfo::ScannedText(ref info) => {
                 // Scanned text fragments' content block-sizes are calculated by the text run
                 // scanner during flow construction.
@@ -2159,11 +1899,6 @@ impl Fragment {
                 let block_flow = FlowRef::deref_mut(&mut info.flow_ref).as_block();
                 self.border_box.size.block = block_flow.base.position.size.block +
                     block_flow.fragment.margin.block_start_end()
-            }
-            SpecificFragmentInfo::Iframe(ref info) => {
-                self.border_box.size.block =
-                    info.calculate_replaced_block_size(style, containing_block_block_size) +
-                    noncontent_block_size;
             }
             _ => panic!("should have been handled above"),
         }
@@ -3190,3 +2925,19 @@ impl Serialize for DebugId {
         serializer.serialize_u16(self.0)
     }
 }
+
+// Return used value for inline-size or block-size.
+//
+// `style_length`: inline-size as given in the CSS
+fn style_length(style_length: LengthOrPercentageOrAuto,
+                container_size: Option<Au>) -> MaybeAuto {
+    match container_size {
+        Some(length) => MaybeAuto::from_style(style_length, length),
+        None => if let LengthOrPercentageOrAuto::Length(length) = style_length {
+            MaybeAuto::Specified(length)
+        } else {
+            MaybeAuto::Auto
+        }
+    }
+}
+
